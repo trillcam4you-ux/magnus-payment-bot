@@ -157,8 +157,205 @@ const MENU = {
     VIEW: '👤 My account',
     ORDERS: '📦 My orders',
     CALLER_ID: '📞 Caller ID',
-    SETUP: '✨ Setup guide'
+    SETUP: '✨ Setup guide',
+    SIP_STATUS: '📡 SIP status'
 };
+
+/** Operator-controlled SIP trunk/route banner (manual). Levels map to customer-facing colors. */
+const SIP_ROUTE_LEVELS = new Set(['strong', 'fair', 'mild', 'down']);
+const SIP_ROUTE_COPY = {
+    strong: {
+        emoji: '🟢',
+        title: 'Strong',
+        line: 'SIP routing looks healthy — good conditions for calls.'
+    },
+    fair: {
+        emoji: '🔵',
+        title: 'Fair',
+        line: 'In the middle — not too bad, not too good. Some variability is possible.'
+    },
+    mild: {
+        emoji: '🟠',
+        title: 'Mild',
+        line: 'Degraded — you might see delays, spotty audio, or failed attempts.'
+    },
+    down: {
+        emoji: '🔴',
+        title: 'Down',
+        line: 'Major routing issues or outage — expect problems until this clears.'
+    }
+};
+
+function escapeHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+async function sendSipRouteStatus(chatId) {
+    const row = await db.getSipRouteStatus();
+    let level = row?.level ? String(row.level).toLowerCase().trim() : 'fair';
+    if (!SIP_ROUTE_LEVELS.has(level)) level = 'fair';
+    const meta = SIP_ROUTE_COPY[level] || SIP_ROUTE_COPY.fair;
+    const rawNote = row?.public_note != null && String(row.public_note).trim() !== ''
+        ? String(row.public_note).trim()
+        : 'No extra details.';
+    const when = formatOrderWhen(row?.updated_at);
+    const byWho =
+        row?.updated_by && String(row.updated_by) !== 'system'
+            ? `operator (${escapeHtml(String(row.updated_by))})`
+            : 'system';
+
+    const html =
+        `<b>📡 SIP route status</b>\n\n` +
+        `${meta.emoji} <b>${escapeHtml(meta.title)}</b>\n` +
+        `${escapeHtml(meta.line)}\n\n` +
+        `<b>Note</b>\n${escapeHtml(rawNote)}\n\n` +
+        `<i>Updated: ${escapeHtml(when)}\nBy: ${byWho}</i>`;
+
+    await bot.sendMessage(chatId, html, { parse_mode: 'HTML' });
+}
+
+/** Admin-only: inline keyboard to set SIP route level (preserves public note unless cleared). */
+async function sendAdminOperatorPanel(chatId) {
+    const subCount = await db.getSubscriberCount();
+    await bot.sendMessage(
+        chatId,
+        '<b>⚙️ Operator panel</b>\n\n' +
+            'Tap a level to update what everyone sees under <b>📡 SIP status</b>. ' +
+            'Your current <i>public note</i> is kept.\n\n' +
+            '🗑 <b>Clear public note</b> removes the note only (level stays).\n\n' +
+            `<b>Broadcasts:</b> 📢 reaches <b>${subCount}</b> subscriber chat(s) (anyone who used the bot or has an order).\n\n` +
+            '<b>Grace credit:</b> <i>🎁 Downtime grace</i> — add time to <b>all paid Magnus usernames</b> (daily, 2 days, 3 days, or weekly).\n\n' +
+            '<i>Custom SIP note:</i> <code>/siproute_set fair Your message</code>',
+        {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: '🟢 Strong', callback_data: 'sipadm_strong' },
+                        { text: '🔵 Fair', callback_data: 'sipadm_fair' }
+                    ],
+                    [
+                        { text: '🟠 Mild', callback_data: 'sipadm_mild' },
+                        { text: '🔴 Down', callback_data: 'sipadm_down' }
+                    ],
+                    [{ text: '🗑 Clear public note', callback_data: 'sipadm_clear_note' }],
+                    [{ text: '📢 Send announcement', callback_data: 'adm_announce_begin' }],
+                    [{ text: '🎁 Downtime grace (all paid users)', callback_data: 'adm_grace_menu' }]
+                ]
+            }
+        }
+    );
+}
+
+/** Broadcast plain announcement HTML to all subscribers; reports counts to adminChatId. */
+async function broadcastAnnouncementToSubscribers(adminChatId, rawText) {
+    const ids = await db.getSubscriberTelegramIds();
+    const html = '<b>📢 Announcement</b>\n\n' + escapeHtml(rawText);
+    let ok = 0;
+    let fail = 0;
+    for (const tid of ids) {
+        try {
+            await bot.sendMessage(tid, html, { parse_mode: 'HTML' });
+            ok++;
+        } catch (e) {
+            fail++;
+            console.error('announcement send failed', tid, e.message);
+        }
+        await new Promise((r) => setTimeout(r, 40));
+    }
+    await bot.sendMessage(
+        adminChatId,
+        `📤 <b>Broadcast finished</b>\n\n✅ Delivered: ${ok}\n❌ Failed (blocked / deleted chat): ${fail}\n👥 List size: ${ids.length}`,
+        { parse_mode: 'HTML' }
+    );
+}
+
+/** Same expiry math as paid renewals — add extraDays onto current line validity in Magnus. */
+async function applyGraceDaysToMagnusUser(user, extraDays) {
+    const days = Number(extraDays);
+    if (!Number.isFinite(days) || days <= 0) {
+        return { success: false, errors: ['invalid days'] };
+    }
+    const parsed = parseMagnusExpiration(user.expirationdate);
+    const anchorMs = Math.max(parsed ? parsed.getTime() : Date.now(), Date.now());
+    const anchor = startOfLocalDay(new Date(anchorMs));
+    const newExp = expiryMidnightAfterPlan(anchor, days);
+    return magnus.update('user', user.id, {
+        expirationdate: formatExpirationDateOnlyForMagnusApi(newExp),
+        enableexpire: 1,
+        expiredays: magnusExpiredays(days),
+        active: 1
+    });
+}
+
+const GRACE_PRESET_DAYS = new Set([1, 2, 3, 7]);
+
+/** Extend every distinct paid-order Magnus username (same rules as renew flow). */
+async function bulkGraceExtendAllMagnus(adminChatId, days, adminTelegramId) {
+    if (!GRACE_PRESET_DAYS.has(days)) {
+        await bot.sendMessage(adminChatId, '❌ Invalid grace length.');
+        return;
+    }
+    const usernames = await db.getDistinctPaidMagnusUsernames();
+    let updated = 0;
+    let notFound = 0;
+    let failed = 0;
+    const errorsSample = [];
+    for (const username of usernames) {
+        try {
+            const user = await magnus.getUserByUsername(username);
+            if (!user) {
+                notFound++;
+                continue;
+            }
+            const upd = await applyGraceDaysToMagnusUser(user, days);
+            if (upd.success) {
+                updated++;
+            } else {
+                failed++;
+                if (errorsSample.length < 5) {
+                    errorsSample.push(`${username}: ${JSON.stringify(upd.errors || upd)}`);
+                }
+            }
+        } catch (e) {
+            failed++;
+            if (errorsSample.length < 5) errorsSample.push(`${username}: ${e.message}`);
+            console.error('grace extend', username, e.message);
+        }
+        await new Promise((r) => setTimeout(r, 75));
+    }
+    console.log(
+        JSON.stringify({
+            op: 'bulk_grace',
+            admin: adminTelegramId,
+            days,
+            totalUsernames: usernames.length,
+            updated,
+            notFound,
+            failed
+        })
+    );
+    let extra = '';
+    if (errorsSample.length) {
+        extra =
+            '\n\n<code>' +
+            escapeHtml(errorsSample.join('\n')).slice(0, 3500) +
+            (errorsSample.join('\n').length > 3500 ? '…' : '') +
+            '</code>';
+    }
+    await bot.sendMessage(
+        adminChatId,
+        `🎁 <b>Grace finished</b> (+${days} day plan)\n\n` +
+            `👥 Usernames in DB: <b>${usernames.length}</b>\n` +
+            `✅ Magnus updated: <b>${updated}</b>\n` +
+            `⚠️ Not found in Magnus: <b>${notFound}</b>\n` +
+            `❌ API/update failed: <b>${failed}</b>${extra}`,
+        { parse_mode: 'HTML' }
+    );
+}
 
 function mainMenuKeyboard() {
     return {
@@ -166,7 +363,8 @@ function mainMenuKeyboard() {
             [MENU.NEW, MENU.EXTEND],
             [MENU.PRICING, MENU.HELP],
             [MENU.VIEW, MENU.CALLER_ID],
-            [MENU.SETUP, MENU.ORDERS]
+            [MENU.SETUP, MENU.ORDERS],
+            [MENU.SIP_STATUS]
         ],
         resize_keyboard: true,
         is_persistent: true,
@@ -257,10 +455,14 @@ async function maybeSendDashboardLink(chatId) {
 }
 
 // Start command
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     sessions.delete(chatId);
-    
+
+    if (msg.chat.type === 'private' && msg.from?.id) {
+        db.upsertSubscriber(String(msg.from.id)).catch(() => {});
+    }
+
     bot.sendMessage(
         chatId,
         '🚀🚀🎉 *Welcome to Proff OTP!*\n\n' + 'What would you like to do?',
@@ -273,7 +475,7 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/orders/, async (msg) => {
     const chatId = msg.chat.id;
-    if (!isAdmin(chatId)) {
+    if (!isAdmin(String(msg.from.id))) {
         await bot.sendMessage(chatId, 'Not authorized.');
         return;
     }
@@ -309,6 +511,72 @@ bot.onText(/\/howto|\/gettingstarted/i, async (msg) => {
     await showGettingStarted(msg.chat.id);
 });
 
+bot.onText(/^\/sipstatus(?:@\S+)?\s*$/i, async (msg) => {
+    await sendSipRouteStatus(msg.chat.id);
+});
+
+/** Admin only — set banner: /siproute_set strong optional note text */
+bot.onText(/^\/siproute_set(?:@\S+)?\s+(strong|fair|mild|down)\s*([\s\S]*)$/i, async (msg, match) => {
+    if (!isAdmin(String(msg.from.id))) {
+        await bot.sendMessage(msg.chat.id, '⛔ Only authorized operators can change SIP route status.');
+        return;
+    }
+    const level = match[1].toLowerCase();
+    const note = (match[2] || '').trim();
+    await db.setSipRouteStatus(level, note || null, msg.from.id);
+    await bot.sendMessage(
+        msg.chat.id,
+        `✅ SIP route status set to <b>${escapeHtml(level)}</b>.`,
+        { parse_mode: 'HTML' }
+    );
+    await sendSipRouteStatus(msg.chat.id);
+});
+
+bot.onText(/^\/siproute_set(?:@\S+)?\s*$/i, async (msg) => {
+    if (!isAdmin(String(msg.from.id))) {
+        await bot.sendMessage(msg.chat.id, '⛔ Only authorized operators can change SIP route status.');
+        return;
+    }
+    await bot.sendMessage(
+        msg.chat.id,
+        '<b>Operator — SIP route status</b>\n\n' +
+            'Sets the public banner everyone sees under 📡 SIP status.\n\n' +
+            '<b>Quick UI:</b> send <code>/admin</code> for tap buttons.\n\n' +
+            '<b>Syntax</b>\n' +
+            '<code>/siproute_set strong</code> — optional note after the level\n' +
+            '<code>/siproute_set fair Trunk vendor maintenance tonight</code>\n\n' +
+            '<b>Levels</b>\n' +
+            '🟢 strong — healthy\n' +
+            '🔵 fair — middle / mixed\n' +
+            '🟠 mild — degraded\n' +
+            '🔴 down — major issues\n\n' +
+            '<i>Only Telegram IDs in ADMIN_TELEGRAM_IDS can run this.</i>',
+        { parse_mode: 'HTML' }
+    );
+});
+
+bot.onText(/^\/admin(?:@\S+)?\s*$/i, async (msg) => {
+    if (!isAdmin(String(msg.from.id))) {
+        await bot.sendMessage(msg.chat.id, '⛔ Not authorized.');
+        return;
+    }
+    await sendAdminOperatorPanel(msg.chat.id);
+});
+
+bot.onText(/^\/cancel(?:@\S+)?\s*$/i, async (msg) => {
+    const chatId = msg.chat.id;
+    const session = sessions.get(chatId);
+    if (
+        session &&
+        (session.step === 'admin_announce_wait_text' ||
+            session.step === 'admin_announce_confirm')
+    ) {
+        delete session.pendingAnnouncement;
+        session.step = 'menu';
+        await bot.sendMessage(chatId, 'Announcement cancelled.');
+    }
+});
+
 /**
  * BTCPay: fulfill latest pending invoice when user sends paid/yes even if session left checkout
  * (e.g. after /start or manual “mark settled” in BTCPay without webhooks).
@@ -338,16 +606,59 @@ async function tryBtcpayPaidShortcut(chatId) {
 
 // Handle messages
 bot.on('message', async (msg) => {
+    if (msg.chat?.type === 'private' && msg.from?.id) {
+        db.upsertSubscriber(String(msg.from.id)).catch(() => {});
+    }
+
     const chatId = msg.chat.id;
     const text = msg.text;
     if (!text || typeof text !== 'string') return;
-    if (text.startsWith('/')) return;
 
     if (!sessions.has(chatId)) {
         sessions.set(chatId, { step: 'menu' });
     }
 
     const session = sessions.get(chatId);
+
+    if (
+        isAdmin(String(msg.from.id)) &&
+        session.step === 'admin_announce_wait_text' &&
+        !text.startsWith('/')
+    ) {
+        const trimmed = text.trim();
+        if (!trimmed) {
+            await bot.sendMessage(chatId, 'Send non-empty text, or type /cancel.');
+            return;
+        }
+        session.pendingAnnouncement = text;
+        session.step = 'admin_announce_confirm';
+        const n = await db.getSubscriberCount();
+        await bot.sendMessage(
+            chatId,
+            `<b>Preview</b> — will reach <b>${n}</b> subscriber chat(s).\n\n<b>📢 Announcement</b>\n\n${escapeHtml(text)}`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: `📤 Send to ${n} chat(s)`, callback_data: 'adm_ann_send' }],
+                        [{ text: '❌ Cancel', callback_data: 'adm_ann_cancel' }]
+                    ]
+                }
+            }
+        );
+        return;
+    }
+
+    if (session.step === 'admin_announce_confirm' && !text.startsWith('/')) {
+        await bot.sendMessage(
+            chatId,
+            'Use <b>Send</b> or <b>Cancel</b> on the preview message, or type /cancel.',
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    if (text.startsWith('/')) return;
 
     const paidish = ['yes', 'paid', 'done'].includes(text.toLowerCase().trim());
     if (paidish && (await tryBtcpayPaidShortcut(chatId)) === 'handled') {
@@ -391,18 +702,50 @@ bot.on('message', async (msg) => {
             break;
 
         case MENU.CALLER_ID:
-        case '📞 Caller ID':
-            session.step = 'callerid_username';
-            await bot.sendMessage(
-                chatId,
-                'Enter your *SIP username* (same as Magnus login):',
-                { parse_mode: 'Markdown' }
-            );
+        case '📞 Caller ID': {
+            const tid = String(msg.from.id);
+            const latestPaid = await db.getLatestPaidOrderForTelegram(tid);
+            const linkedUser = latestPaid?.magnus_username?.trim();
+            if (linkedUser) {
+                session.step = 'callerid_waiting_choice';
+                const btnLabel =
+                    linkedUser.length > 36 ? `✅ Use ${linkedUser.slice(0, 33)}…` : `✅ Use ${linkedUser}`;
+                await bot.sendMessage(
+                    chatId,
+                    '📞 *Caller ID*\n\n' +
+                        'We found an account linked to your purchases:\n' +
+                        `\`${linkedUser}\`\n\n` +
+                        '*Choose how to continue:*',
+                    {
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    { text: btnLabel, callback_data: 'cid_saved' },
+                                    { text: '🔑 Different account', callback_data: 'cid_other' }
+                                ]
+                            ]
+                        }
+                    }
+                );
+            } else {
+                session.step = 'callerid_username';
+                await bot.sendMessage(
+                    chatId,
+                    'Enter your *SIP username* (same as Magnus login):',
+                    { parse_mode: 'Markdown' }
+                );
+            }
             break;
+        }
 
         case MENU.SETUP:
         case '🚀 How to get started':
             await showGettingStarted(chatId);
+            break;
+
+        case MENU.SIP_STATUS:
+            await sendSipRouteStatus(chatId);
             break;
 
         default:
@@ -454,6 +797,22 @@ async function editCheckoutSummary(bot, msg, plainText) {
     } else {
         await bot.editMessageCaption(plainText, form);
     }
+}
+
+/** Bold reminder after checkout — edited invoice message stays plain text (URLs / underscores). */
+function sendPostCheckoutPaymentInstructions(chatId) {
+    return bot.sendMessage(
+        chatId,
+        '📌 *READ THIS — YOUR LOGIN IS SENT IN THIS CHAT*\n' +
+            '_Not by email — stay in Telegram._\n\n' +
+            '1️⃣ Open checkout and complete payment.\n' +
+            '2️⃣ Wait for confirmations _(Bitcoin can take a few minutes)._\n' +
+            '3️⃣ When BTCPay marks the invoice paid, your login appears *here automatically*.\n\n' +
+            '*If nothing shows up after a minute,* type exactly:\n\n' +
+            '`paid`\n\n' +
+            `_Tip: tap ${MENU.ORDERS} or send /myaccount after purchase._`,
+        { parse_mode: 'Markdown' }
+    );
 }
 
 function formatOrderWhen(iso) {
@@ -556,7 +915,8 @@ async function showHelp(chatId) {
         'ℹ️ *Help*\n\n' +
             `• *${MENU.NEW}* — New VoIP line + credentials\n` +
             `• *${MENU.EXTEND}* — Add time to an existing username\n\n` +
-            `• *${MENU.ORDERS}* — Order status, checkout links for unpaid invoices\n\n` +
+            `• *${MENU.ORDERS}* — Order status, checkout links for unpaid invoices\n` +
+            `• *${MENU.SIP_STATUS}* — operator route health (🟢🔵🟠🔴) + /sipstatus\n\n` +
             'Both flows let you pick a plan. With *BTCPay* or a *BTC address*, you get checkout / payment instructions; otherwise reply *yes* after choosing (demo).\n\n' +
             '*SIP* uses the *same* username and password as Magnus.\n\n' +
             `After purchase: *${MENU.VIEW}* or /myaccount — plus a *payment receipt* message.\n` +
@@ -596,6 +956,14 @@ async function showGettingStarted(chatId) {
 // Handle user input
 async function handleInput(chatId, text, session) {
     switch (session.step) {
+        case 'callerid_waiting_choice':
+            await bot.sendMessage(
+                chatId,
+                'Tap *Use …* or *Different account* on the buttons above.',
+                { parse_mode: 'Markdown' }
+            );
+            break;
+
         case 'enter_username':
             session.username = text;
             session.step = 'enter_password';
@@ -707,6 +1075,217 @@ bot.on('callback_query', async (query) => {
     const ack = (text) => bot.answerCallbackQuery(query.id, { text }).catch(() => {});
 
     try {
+        if (data === 'cid_saved') {
+            await ack();
+            const latestPaid = await db.getLatestPaidOrderForTelegram(String(chatId));
+            const un = latestPaid?.magnus_username?.trim();
+            if (!un) {
+                session.step = 'callerid_username';
+                await bot.sendMessage(
+                    chatId,
+                    'No linked username found. Enter your *SIP username* (same as Magnus login):',
+                    { parse_mode: 'Markdown' }
+                );
+                return;
+            }
+            const cidUser = await magnus.getUserByUsername(un);
+            if (!cidUser) {
+                session.step = 'menu';
+                await bot.sendMessage(
+                    chatId,
+                    '❌ That username is not in billing anymore. Tap *📞 Caller ID* and use *Different account*, or contact support.',
+                    { parse_mode: 'Markdown' }
+                );
+                return;
+            }
+            session.cid_user_id = cidUser.id;
+            session.step = 'callerid_new';
+            await bot.sendMessage(
+                chatId,
+                `Using \`${un}\`.\n\n` +
+                    'Send the *Caller ID* for outbound calls — digits starting with *1*, no + sign (e.g. `18003884634`).\n\n' +
+                    '_Your carrier/trunk and Magnus must allow this number._',
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
+        if (data === 'cid_other') {
+            await ack();
+            session.step = 'callerid_username';
+            await bot.sendMessage(
+                chatId,
+                'Enter your *SIP username* (same as Magnus login):',
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
+
+        if (data.startsWith('sipadm_')) {
+            if (!isAdmin(String(from.id))) {
+                await ack('Not authorized');
+                return;
+            }
+            if (data === 'sipadm_clear_note') {
+                await ack('Public note cleared');
+                const row = await db.getSipRouteStatus();
+                let level = row?.level ? String(row.level).toLowerCase().trim() : 'fair';
+                if (!SIP_ROUTE_LEVELS.has(level)) level = 'fair';
+                await db.setSipRouteStatus(level, null, from.id);
+                await sendSipRouteStatus(chatId);
+                return;
+            }
+            const level = data.replace(/^sipadm_/, '').toLowerCase();
+            if (!SIP_ROUTE_LEVELS.has(level)) {
+                await ack('Invalid');
+                return;
+            }
+            await ack(`Published: ${level}`);
+            const row = await db.getSipRouteStatus();
+            let note = null;
+            if (row?.public_note != null && String(row.public_note).trim() !== '') {
+                note = String(row.public_note).trim();
+            }
+            await db.setSipRouteStatus(level, note, from.id);
+            await sendSipRouteStatus(chatId);
+            return;
+        }
+
+        if (data === 'adm_announce_begin') {
+            if (!isAdmin(String(from.id))) {
+                await ack('Not authorized');
+                return;
+            }
+            session.step = 'admin_announce_wait_text';
+            await ack();
+            await bot.sendMessage(
+                chatId,
+                '📢 Send your announcement as your <b>next message</b> (plain text).\n\n' +
+                    'Reach: everyone in the subscriber list (used the bot in DM and/or has an order).\n\n' +
+                    '/cancel — abort',
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        if (data === 'adm_ann_send') {
+            if (!isAdmin(String(from.id))) {
+                await ack('Not authorized');
+                return;
+            }
+            const body = session.pendingAnnouncement;
+            if (!body || !String(body).trim()) {
+                await ack('Nothing to send');
+                return;
+            }
+            await ack('Sending…');
+            delete session.pendingAnnouncement;
+            session.step = 'menu';
+            await broadcastAnnouncementToSubscribers(chatId, body);
+            return;
+        }
+
+        if (data === 'adm_ann_cancel') {
+            if (!isAdmin(String(from.id))) {
+                await ack();
+                return;
+            }
+            await ack('Cancelled');
+            delete session.pendingAnnouncement;
+            session.step = 'menu';
+            await bot.sendMessage(chatId, 'Broadcast cancelled.');
+            return;
+        }
+
+        if (data === 'adm_grace_menu') {
+            if (!isAdmin(String(from.id))) {
+                await ack('Not authorized');
+                return;
+            }
+            await ack();
+            const paidUsers = await db.getDistinctPaidMagnusUsernames();
+            await bot.sendMessage(
+                chatId,
+                '<b>🎁 Downtime grace — all paid accounts</b>\n\n' +
+                    `Uses every <b>unique Magnus username</b> from <i>paid</i> orders in this bot’s database ` +
+                    `(currently <b>${paidUsers.length}</b> username(s)). Each gets <b>extra calendar time</b> ` +
+                    'on top of their current expiry — same math as a paid renew.\n\n' +
+                    '<b>Pick credit length</b> (downtime grace options):',
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: '+1 day (daily)', callback_data: 'adm_gr_pr_1' },
+                                { text: '+2 days', callback_data: 'adm_gr_pr_2' }
+                            ],
+                            [
+                                { text: '+3 days', callback_data: 'adm_gr_pr_3' },
+                                { text: '+7 days (weekly)', callback_data: 'adm_gr_pr_7' }
+                            ]
+                        ]
+                    }
+                }
+            );
+            return;
+        }
+
+        const grPr = data.match(/^adm_gr_pr_(\d+)$/);
+        if (grPr) {
+            if (!isAdmin(String(from.id))) {
+                await ack();
+                return;
+            }
+            const days = parseInt(grPr[1], 10);
+            if (!GRACE_PRESET_DAYS.has(days)) {
+                await ack('Invalid');
+                return;
+            }
+            await ack();
+            const names = await db.getDistinctPaidMagnusUsernames();
+            const n = names.length;
+            await bot.sendMessage(
+                chatId,
+                `Add <b>+${days} day(s)</b> (plan credit) on Magnus for <b>${n}</b> username(s) from paid orders?\n\n` +
+                    '<i>Magnus API must be reachable. Double-check before confirming.</i>',
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: `✅ Apply +${days} day(s) to all`, callback_data: `adm_gr_do_${days}` }],
+                            [{ text: '❌ Cancel', callback_data: 'adm_gr_x' }]
+                        ]
+                    }
+                }
+            );
+            return;
+        }
+
+        const grDo = data.match(/^adm_gr_do_(\d+)$/);
+        if (grDo) {
+            if (!isAdmin(String(from.id))) {
+                await ack('Not authorized');
+                return;
+            }
+            const days = parseInt(grDo[1], 10);
+            if (!GRACE_PRESET_DAYS.has(days)) {
+                await ack();
+                return;
+            }
+            await ack('Applying…');
+            await bulkGraceExtendAllMagnus(chatId, days, from.id);
+            return;
+        }
+
+        if (data === 'adm_gr_x') {
+            if (!isAdmin(String(from.id))) {
+                await ack();
+                return;
+            }
+            await ack('Cancelled');
+            await bot.sendMessage(chatId, 'Grace credit cancelled.');
+            return;
+        }
+
         if (data.startsWith('new_plan_')) {
             const planKey = data.replace('new_plan_', '');
             const plan = PLANS[planKey];
@@ -791,7 +1370,7 @@ bot.on('callback_query', async (query) => {
                     paymentBlock
             );
 
-            await bot.sendMessage(chatId, 'Complete your payment to activate your selected plan.');
+            await sendPostCheckoutPaymentInstructions(chatId);
             await ack();
         } else if (data.startsWith('existing_plan_')) {
             const planKey = data.replace('existing_plan_', '');
@@ -862,7 +1441,7 @@ bot.on('callback_query', async (query) => {
                     paymentBlock
             );
 
-            await bot.sendMessage(chatId, 'Complete your payment to activate your selected plan.');
+            await sendPostCheckoutPaymentInstructions(chatId);
             await ack();
         } else {
             await ack();

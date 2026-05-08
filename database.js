@@ -104,6 +104,131 @@ class Database {
                     expires_at DATETIME NOT NULL
                 )
             `);
+
+            this.db.run(`
+                CREATE TABLE IF NOT EXISTS sip_route_status (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    level TEXT NOT NULL DEFAULT 'fair',
+                    public_note TEXT,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT
+                )
+            `);
+            this.db.run(`
+                INSERT OR IGNORE INTO sip_route_status (id, level, public_note, updated_at, updated_by)
+                VALUES (
+                    1,
+                    'fair',
+                    'No incidents reported.',
+                    datetime('now'),
+                    'system'
+                )
+            `);
+
+            this.db.run(`
+                CREATE TABLE IF NOT EXISTS bot_subscribers (
+                    telegram_id TEXT PRIMARY KEY,
+                    last_seen TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            `);
+            this.db.run(`
+                INSERT OR IGNORE INTO bot_subscribers (telegram_id, last_seen)
+                SELECT DISTINCT telegram_id, datetime('now')
+                FROM orders
+                WHERE telegram_id IS NOT NULL AND TRIM(telegram_id) != ''
+            `);
+        });
+    }
+
+    /** Anyone who has chatted privately or appears in orders — used for operator broadcasts. */
+    upsertSubscriber(telegramId) {
+        const tid = String(telegramId).trim();
+        if (!tid) return Promise.resolve(0);
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `INSERT INTO bot_subscribers (telegram_id, last_seen)
+                 VALUES (?, datetime('now'))
+                 ON CONFLICT(telegram_id) DO UPDATE SET last_seen = excluded.last_seen`,
+                [tid],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes);
+                }
+            );
+        });
+    }
+
+    getSubscriberTelegramIds() {
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                'SELECT telegram_id FROM bot_subscribers ORDER BY telegram_id',
+                [],
+                (err, rows) => {
+                    if (err) reject(err);
+                    else resolve((rows || []).map((r) => String(r.telegram_id)));
+                }
+            );
+        });
+    }
+
+    getSubscriberCount() {
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT COUNT(*) AS n FROM bot_subscribers', [], (err, row) => {
+                if (err) reject(err);
+                else resolve(row && Number(row.n) >= 0 ? Number(row.n) : 0);
+            });
+        });
+    }
+
+    /** Every unique Magnus username that has a paid order (source for operator grace / bulk). */
+    getDistinctPaidMagnusUsernames() {
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT DISTINCT magnus_username FROM orders
+                 WHERE status = 'paid'
+                   AND magnus_username IS NOT NULL
+                   AND TRIM(magnus_username) != ''
+                 ORDER BY magnus_username`,
+                [],
+                (err, rows) => {
+                    if (err) reject(err);
+                    else
+                        resolve(
+                            (rows || [])
+                                .map((r) => String(r.magnus_username).trim())
+                                .filter((u) => u.length > 0)
+                        );
+                }
+            );
+        });
+    }
+
+    /** Single-row SIP route banner for customers ({ level, public_note, updated_at, updated_by }). */
+    getSipRouteStatus() {
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT * FROM sip_route_status WHERE id = 1', [], (err, row) => {
+                if (err) reject(err);
+                else resolve(row || null);
+            });
+        });
+    }
+
+    /** level: strong | fair | mild | down */
+    setSipRouteStatus(level, publicNote, updatedByTelegramId) {
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                `UPDATE sip_route_status SET
+                    level = ?,
+                    public_note = ?,
+                    updated_at = datetime('now'),
+                    updated_by = ?
+                 WHERE id = 1`,
+                [level, publicNote ?? null, updatedByTelegramId != null ? String(updatedByTelegramId) : null],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes);
+                }
+            );
         });
     }
 
